@@ -55,6 +55,11 @@ export default function ConciergeBot() {
     const [loadingStatus, setLoadingStatus] = useState<string>("");
     const [isDarkMode, setIsDarkMode] = useState(false); // Light theme by default
 
+    // Primary Signals - captures essential user context
+    const [showPrimarySignals, setShowPrimarySignals] = useState(false);
+    const [primarySignals, setPrimarySignals] = useState({ status: "", goal: "" });
+    const [hasUserContext, setHasUserContext] = useState(false); // True when we have enough context to chat
+
     // Refs
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -150,13 +155,106 @@ export default function ConciergeBot() {
                 setShowInitialForm(false);
                 setShowFormPrompt(false);
                 setShowFormExpanded(false);
-                setMessages((prev) => [
-                    ...prev,
-                    { role: "assistant", content: data.message },
-                ]);
+
+                // Check if user provided meaningful learning context
+                const hasLearningContext = formData.education_level && formData.goals && formData.goals.trim().length > 5;
+
+                if (hasLearningContext) {
+                    // User provided enough context - show acknowledgement then search
+                    setHasUserContext(true);
+
+                    // Show acknowledgement first
+                    const acknowledgement = `Thanks ${formData.name}! 🎉 I see you're at the ${formData.education_level} level and interested in ${formData.goals}. Let me find the best courses for you...`;
+                    setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: acknowledgement },
+                    ]);
+
+                    // Trigger automatic course search
+                    setTimeout(() => triggerCourseSearch(formData.goals, formData.education_level), 500);
+                } else {
+                    // Show Primary Signals to get essential context
+                    setShowPrimarySignals(true);
+                }
             }
         } catch (error) {
             console.error("Failed to submit lead:", error);
+        }
+    };
+
+    // Helper function to trigger course search with context
+    const triggerCourseSearch = async (learningGoal: string, educationLevel: string) => {
+        setIsLoading(true);
+        setStreamingMessage("");
+        streamingContentRef.current = "";
+        setLoadingStatus("Finding relevant courses...");
+
+        const contextQuery = `Based on my ${educationLevel} background, I want to ${learningGoal}. What courses would you recommend?`;
+
+        try {
+            const ws = new WebSocket(`${WS_URL}/ws/concierge/chat`);
+            wsRef.current = ws;
+
+            ws.onopen = () => {
+                ws.send(
+                    JSON.stringify({
+                        message: contextQuery,
+                        session_id: sessionId,
+                        conversation_id: conversationId,
+                        lead_id: leadId,
+                        user_context: {
+                            professional_status: educationLevel,
+                            learning_goal: learningGoal,
+                            education_level: educationLevel,
+                            interests: learningGoal
+                        }
+                    })
+                );
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                switch (data.type) {
+                    case "conversation_id":
+                        setConversationId(data.conversation_id);
+                        break;
+                    case "token":
+                        setLoadingStatus("Generating recommendations...");
+                        streamingContentRef.current += data.content;
+                        setStreamingMessage(streamingContentRef.current);
+                        break;
+                    case "done":
+                        const finalMessage = streamingContentRef.current;
+                        setMessages((prev) => [
+                            ...prev,
+                            { role: "assistant", content: finalMessage },
+                        ]);
+                        setStreamingMessage("");
+                        streamingContentRef.current = "";
+                        setIsLoading(false);
+                        setLoadingStatus("");
+                        ws.close();
+                        break;
+                    case "error":
+                        setIsLoading(false);
+                        setLoadingStatus("");
+                        ws.close();
+                        break;
+                }
+            };
+
+            ws.onerror = () => {
+                setIsLoading(false);
+                setLoadingStatus("");
+            };
+
+            ws.onclose = () => {
+                wsRef.current = null;
+            };
+        } catch (error) {
+            console.error("Failed to search courses:", error);
+            setIsLoading(false);
         }
     };
 
@@ -166,19 +264,121 @@ export default function ConciergeBot() {
         setShowInitialForm(false);
         setShowFormPrompt(false);
         setShowFormExpanded(false);
-        setMessages((prev) => [
-            ...prev,
-            {
-                role: "assistant",
-                content: "No problem! Feel free to ask me anything about our courses. What would you like to learn? 🎯",
-            },
-        ]);
+        // Show Primary Signals to get essential context
+        setShowPrimarySignals(true);
     };
 
     const handleShareDetails = () => {
         setShowInitialForm(false);
         setShowFormPrompt(false);
         setShowFormExpanded(true);
+    };
+
+    const handlePrimarySignalsSubmit = async () => {
+        if (!primarySignals.status.trim() || !primarySignals.goal.trim()) return;
+
+        // Hide Primary Signals card and enable chat
+        setShowPrimarySignals(false);
+        setHasUserContext(true);
+
+        // Show acknowledgement first
+        const acknowledgement = `Perfect! 🎯 As a ${primarySignals.status} looking to ${primarySignals.goal}, I'll find the most relevant courses for you. Let me search our catalog...`;
+        setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: acknowledgement },
+        ]);
+
+        // Start loading after a brief delay for acknowledgement to show
+        setTimeout(async () => {
+            setIsLoading(true);
+            setStreamingMessage("");
+            streamingContentRef.current = "";
+            setLoadingStatus("Finding relevant courses...");
+
+            // Construct the initial query from the collected context
+            const contextQuery = `I'm a ${primarySignals.status} and I want to ${primarySignals.goal}. What courses would you recommend for me?`;
+
+            try {
+                // Use WebSocket for streaming - automatically search for relevant courses
+                const ws = new WebSocket(`${WS_URL}/ws/concierge/chat`);
+                wsRef.current = ws;
+
+                ws.onopen = () => {
+                    setLoadingStatus("Finding relevant courses...");
+                    ws.send(
+                        JSON.stringify({
+                            message: contextQuery,
+                            session_id: sessionId,
+                            conversation_id: conversationId,
+                            lead_id: leadId,
+                            user_context: {
+                                professional_status: primarySignals.status,
+                                learning_goal: primarySignals.goal,
+                                education_level: formData.education_level || null,
+                                interests: formData.goals || null
+                            }
+                        })
+                    );
+                };
+
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    switch (data.type) {
+                        case "conversation_id":
+                            setConversationId(data.conversation_id);
+                            break;
+                        case "token":
+                            if (loadingStatus !== "Generating recommendations...") {
+                                setLoadingStatus("Generating recommendations...");
+                            }
+                            streamingContentRef.current += data.content;
+                            setStreamingMessage(streamingContentRef.current);
+                            break;
+                        case "done":
+                            const finalMessage = streamingContentRef.current;
+                            setMessages((prev) => [
+                                ...prev,
+                                { role: "assistant", content: finalMessage },
+                            ]);
+                            setStreamingMessage("");
+                            streamingContentRef.current = "";
+                            setIsLoading(false);
+                            setLoadingStatus("");
+                            ws.close();
+                            break;
+                        case "error":
+                            console.error("WebSocket error:", data.message);
+                            setIsLoading(false);
+                            setLoadingStatus("");
+                            ws.close();
+                            break;
+                    }
+                };
+
+                ws.onerror = () => {
+                    console.error("WebSocket connection failed");
+                    setIsLoading(false);
+                    setLoadingStatus("");
+                    // Fallback message
+                    setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: "I appreciate you sharing that! Let me help you find the perfect courses. What specific skills or topics are you most interested in learning?" },
+                    ]);
+                };
+
+                ws.onclose = () => {
+                    wsRef.current = null;
+                };
+            } catch (error) {
+                console.error("Failed to process context:", error);
+                setIsLoading(false);
+                setMessages((prev) => [
+                    ...prev,
+                    { role: "assistant", content: "Thanks for sharing! I'd love to help you find the right courses. What specific area would you like to explore?" },
+                ]);
+            }
+        }, 500); // End of setTimeout
     };
 
     const sendMessage = async (message: string) => {
@@ -209,6 +409,12 @@ export default function ConciergeBot() {
                         session_id: sessionId,
                         conversation_id: conversationId,
                         lead_id: leadId,
+                        user_context: primarySignals.status && primarySignals.goal ? {
+                            professional_status: primarySignals.status,
+                            learning_goal: primarySignals.goal,
+                            education_level: formData.education_level || null,
+                            interests: formData.goals || null
+                        } : null
                     })
                 );
             };
@@ -637,11 +843,91 @@ export default function ConciergeBot() {
                             </div>
                         )}
 
+                        {/* Primary Signals Card - Exhibitly-style inline context capture */}
+                        {showPrimarySignals && (
+                            <div className={`rounded-xl overflow-hidden backdrop-blur-sm border animate-in slide-in-from-bottom-4 duration-500 ${isDarkMode ? 'bg-slate-800/90 border-slate-600/50' : 'bg-white/95 border-gray-200/50 shadow-xl'}`}>
+                                {/* Header */}
+                                <div className={`px-5 py-4 border-b ${isDarkMode ? 'bg-gradient-to-r from-amber-500/10 to-orange-500/10 border-slate-700' : 'bg-gradient-to-r from-amber-50 to-orange-50 border-gray-100'}`}>
+                                    <div className="flex items-center gap-3">
+                                        <div className={`w-10 h-10 rounded-full flex items-center justify-center ${isDarkMode ? 'bg-amber-500/20' : 'bg-amber-100'}`}>
+                                            <span className="text-xl">✨</span>
+                                        </div>
+                                        <div>
+                                            <h4 className={`font-semibold text-[15px] ${isDarkMode ? 'text-white' : 'text-gray-800'}`}>
+                                                Help Me Understand You Better
+                                            </h4>
+                                            <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-gray-500'}`}>
+                                                A quick intro helps me give you the best recommendations
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Inline Sentence Flow */}
+                                <div className="p-5">
+                                    <div className={`rounded-xl p-4 ${isDarkMode ? 'bg-slate-700/50' : 'bg-gray-50/80'}`}>
+                                        <div className="flex flex-wrap items-center gap-2 text-[15px]">
+                                            <span className={`font-medium ${isDarkMode ? 'text-slate-300' : 'text-gray-700'}`}>I'm currently a</span>
+                                            <div className="relative flex-1 min-w-[180px]">
+                                                <span className={`absolute left-3 top-1/2 -translate-y-1/2 ${isDarkMode ? 'text-slate-400' : 'text-gray-400'}`}>🏢</span>
+                                                <input
+                                                    type="text"
+                                                    placeholder="e.g., Software Developer, Student..."
+                                                    value={primarySignals.status}
+                                                    onChange={(e) => setPrimarySignals(prev => ({ ...prev, status: e.target.value.slice(0, 100) }))}
+                                                    maxLength={100}
+                                                    className={`w-full pl-10 pr-3 py-2.5 rounded-lg border text-sm font-medium focus:outline-none focus:ring-2 focus:ring-amber-400 transition-all ${isDarkMode
+                                                        ? 'bg-slate-600 border-slate-500 text-white placeholder-slate-400'
+                                                        : 'bg-white border-gray-200 text-gray-800 placeholder-gray-400 shadow-sm'}`}
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="flex flex-wrap items-center gap-2 text-[15px] mt-3">
+                                            <span className={`font-medium ${isDarkMode ? 'text-slate-300' : 'text-gray-700'}`}>looking to</span>
+                                            <div className="relative flex-1 min-w-[180px]">
+                                                <span className={`absolute left-3 top-1/2 -translate-y-1/2 ${isDarkMode ? 'text-slate-400' : 'text-gray-400'}`}>🎯</span>
+                                                <input
+                                                    type="text"
+                                                    placeholder="e.g., get my first job, upskill in AI..."
+                                                    value={primarySignals.goal}
+                                                    onChange={(e) => setPrimarySignals(prev => ({ ...prev, goal: e.target.value.slice(0, 100) }))}
+                                                    maxLength={100}
+                                                    className={`w-full pl-10 pr-3 py-2.5 rounded-lg border text-sm font-medium focus:outline-none focus:ring-2 focus:ring-amber-400 transition-all ${isDarkMode
+                                                        ? 'bg-slate-600 border-slate-500 text-white placeholder-slate-400'
+                                                        : 'bg-white border-gray-200 text-gray-800 placeholder-gray-400 shadow-sm'}`}
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Submit Button */}
+                                    <div className="flex justify-end mt-4">
+                                        <button
+                                            onClick={handlePrimarySignalsSubmit}
+                                            disabled={!primarySignals.status.trim() || !primarySignals.goal.trim()}
+                                            className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition-all ${primarySignals.status.trim() && primarySignals.goal.trim()
+                                                ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white shadow-lg hover:shadow-xl hover:scale-[1.02]'
+                                                : isDarkMode
+                                                    ? 'bg-slate-600 text-slate-400 cursor-not-allowed'
+                                                    : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                                                }`}
+                                        >
+                                            <span>Let's Get Started</span>
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         <div ref={messagesEndRef} />
                     </div>
 
                     {/* Quick Actions */}
-                    {!showInitialForm && !showFormPrompt && !showFormExpanded && quickActions.length > 0 && messages.length <= 2 && (
+                    {!showInitialForm && !showFormPrompt && !showFormExpanded && !showPrimarySignals && quickActions.length > 0 && messages.length <= 2 && (
                         <div className={`px-4 py-3 border-t ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-gray-50 border-gray-100'}`}>
                             <p className={`text-xs mb-2 font-medium ${isDarkMode ? 'text-slate-500' : 'text-gray-500'}`}>Quick actions:</p>
                             <div className="flex flex-wrap gap-2">
@@ -667,14 +953,17 @@ export default function ConciergeBot() {
                                 value={inputValue}
                                 onChange={(e) => setInputValue(e.target.value)}
                                 onKeyDown={handleKeyDown}
-                                placeholder="Ask me anything..."
-                                disabled={isLoading}
-                                className={`flex-1 px-4 py-3 rounded-full text-[15px] font-medium focus:outline-none focus:ring-2 focus:ring-amber-400 disabled:opacity-50 ${isDarkMode ? 'bg-slate-700 text-slate-100 placeholder-slate-400' : 'bg-gray-100 text-gray-800 placeholder-gray-400'}`}
+                                placeholder={showPrimarySignals ? "Complete the intro above first..." : showInitialForm ? "Fill out the form first..." : "Ask me anything..."}
+                                disabled={isLoading || showPrimarySignals || showInitialForm}
+                                className={`flex-1 px-4 py-3 rounded-full text-[15px] font-medium focus:outline-none focus:ring-2 focus:ring-amber-400 disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'bg-slate-700 text-slate-100 placeholder-slate-400' : 'bg-gray-100 text-gray-800 placeholder-gray-400'}`}
                             />
                             <button
                                 onClick={() => sendMessage(inputValue)}
-                                disabled={!inputValue.trim() || isLoading}
-                                className="w-11 h-11 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white flex items-center justify-center hover:opacity-90 transition-opacity disabled:opacity-50"
+                                disabled={!inputValue.trim() || isLoading || showPrimarySignals || showInitialForm}
+                                className={`w-11 h-11 rounded-full flex items-center justify-center transition-all disabled:cursor-not-allowed ${showPrimarySignals || showInitialForm
+                                    ? isDarkMode ? 'bg-slate-600 text-slate-400' : 'bg-gray-200 text-gray-400'
+                                    : 'bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:opacity-90 disabled:opacity-50'
+                                    }`}
                             >
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
